@@ -103,15 +103,37 @@ def snapshots(github: GitHub, current: dict) -> list[dict]:
                 and run["event"]
                 in {"schedule", "workflow_run", "workflow_dispatch"}
             ):
-                result.append({**artifact, "_delivery_run": run})
+                document = None
+                run_attempt = source.get("run_attempt")
+                if not artifact["expired"]:
+                    document = github.artifact_json(
+                        artifact["id"], "discord-state.json"
+                    )
+                    checkpoint = (
+                        document.get("checkpoint", {})
+                        if isinstance(document, dict)
+                        else {}
+                    )
+                    if run_attempt is None:
+                        run_attempt = checkpoint.get("run_attempt")
+                if type(run_attempt) is not int or run_attempt <= 0:
+                    run_attempt = None
+                result.append(
+                    {
+                        **artifact,
+                        "_delivery_run": run,
+                        "_document": document,
+                        "_run_attempt": run_attempt,
+                    }
+                )
     return sorted(
         result,
         key=lambda item: (
             item["_delivery_run"]["created_at"],
             item["_delivery_run"]["id"],
-            item["_delivery_run"]["run_attempt"],
-            item["name"] == ARTIFACTS[1],
+            item["_run_attempt"] or 0,
             item["created_at"],
+            item["name"] == ARTIFACTS[1],
         ),
         reverse=True,
     )
@@ -146,18 +168,27 @@ def restore(github: GitHub, current: dict, path: Path, hours: int) -> None:
                 "Срок хранения последнего снимка истёк. "
                 "Нужна сохранённая копия очереди; пустая очередь не создана"
             )
+        attempt = latest["_run_attempt"]
+        attempts = range(attempt, attempt + 1) if attempt is not None else None
         if latest["name"] == ARTIFACTS[0] and send_was_attempted(
-            github, latest["_delivery_run"]
+            github, latest["_delivery_run"], attempts
         ):
             raise GitHubError(
                 "Последний снимок создан до уже начатой отправки. "
                 "Автоматический повтор запрещён во избежание дубликатов"
             )
-        document = github.artifact_json(latest["id"], "discord-state.json")
+        document = latest["_document"] or github.artifact_json(
+            latest["id"], "discord-state.json"
+        )
         validate(document)
         checkpoint = document["checkpoint"]
-        if checkpoint["run_id"] != latest["workflow_run"]["id"]:
-            raise GitHubError("Снимок очереди принадлежит другому запуску")
+        if (
+            checkpoint["run_id"] != latest["workflow_run"]["id"]
+            or checkpoint["run_attempt"] != latest["_run_attempt"]
+        ):
+            raise GitHubError(
+                "Снимок очереди принадлежит другому запуску или попытке"
+            )
         print(
             f"Очередь восстановлена из артефакта {latest['id']}. "
             f"Ожидают доставки: {len(document['pending'])}."

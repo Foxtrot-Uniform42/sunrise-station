@@ -29,10 +29,11 @@ class FakeGitHub:
     root = "/repos/example/repository"
     repository = "example/repository"
 
-    def __init__(self, artifacts, runs, jobs=None):
+    def __init__(self, artifacts, runs, jobs=None, documents=None):
         self.artifacts = artifacts
         self.runs = runs
         self.jobs = jobs or []
+        self.documents = documents or {}
         self.deleted = []
 
     def json(self, method, path, **kwargs):
@@ -57,32 +58,47 @@ class FakeGitHub:
         raise AssertionError((path, key, params))
 
     def artifact_json(self, artifact_id, filename):
-        return {
-            "version": 1,
-            "cursor": "2026-09-12T00:00:00Z",
-            "seen": {},
-            "pending": {},
-            "commit_comments": {},
-            "messages": {},
-            "checkpoint": {"run_id": 2, "run_attempt": 1},
-        }
+        if artifact_id in self.documents:
+            return self.documents[artifact_id]
+        artifact_data = next(
+            item for item in self.artifacts if item["id"] == artifact_id
+        )
+        return state_document(
+            artifact_data["workflow_run"]["id"],
+            artifact_data["workflow_run"].get("run_attempt", 1),
+        )
 
 
-def artifact(identifier, name, run_id, created_at):
+def state_document(run_id, run_attempt):
     return {
+        "version": 1,
+        "cursor": "2026-09-12T00:00:00Z",
+        "seen": {},
+        "pending": {},
+        "commit_comments": {},
+        "messages": {},
+        "checkpoint": {"run_id": run_id, "run_attempt": run_attempt},
+    }
+
+
+def artifact(identifier, name, run_id, created_at, run_attempt=None):
+    result = {
         "id": identifier,
         "name": name,
         "created_at": created_at,
         "expired": False,
         "workflow_run": {"id": run_id, "head_branch": "master"},
     }
+    if run_attempt is not None:
+        result["workflow_run"]["run_attempt"] = run_attempt
+    return result
 
 
-def run(identifier, created_at, conclusion="success"):
+def run(identifier, created_at, conclusion="success", run_attempt=1):
     return {
         "id": identifier,
         "created_at": created_at,
-        "run_attempt": 1,
+        "run_attempt": run_attempt,
         "workflow_id": 10,
         "head_repository": {"full_name": "example/repository"},
         "event": "workflow_run",
@@ -125,6 +141,26 @@ class StateTests(unittest.TestCase):
         self.assertEqual(result[0]["id"], 100)
         self.assertEqual(result[0]["name"], ARTIFACTS[1])
 
+    def test_snapshots_keep_attempt_from_each_artifact_checkpoint(self):
+        github = FakeGitHub(
+            [
+                artifact(200, ARTIFACTS[1], 7, "2026-09-12T00:01:00Z"),
+                artifact(100, ARTIFACTS[1], 7, "2026-09-12T00:02:00Z"),
+            ],
+            {7: run(7, "2026-09-12T00:00:00Z", run_attempt=2)},
+            documents={
+                200: state_document(7, 1),
+                100: state_document(7, 2),
+            },
+        )
+
+        result = snapshots(github, {"workflow_id": 10})
+
+        self.assertEqual(
+            [(item["id"], item["_run_attempt"]) for item in result],
+            [(100, 2), (200, 1)],
+        )
+
     def test_restore_refuses_ambiguous_pre_send_snapshot(self):
         github = FakeGitHub(
             [artifact(1, ARTIFACTS[0], 2, "2026-09-12T00:01:01Z")],
@@ -139,6 +175,30 @@ class StateTests(unittest.TestCase):
         )
         with tempfile.TemporaryDirectory() as directory:
             with self.assertRaisesRegex(RuntimeError, "повтор запрещён"):
+                restore(
+                    github,
+                    {"id": 3, "run_attempt": 1, "workflow_id": 10},
+                    Path(directory) / "state.json",
+                    24,
+                )
+
+    def test_restore_rejects_checkpoint_from_another_attempt(self):
+        github = FakeGitHub(
+            [
+                artifact(
+                    1,
+                    ARTIFACTS[1],
+                    2,
+                    "2026-09-12T00:01:01Z",
+                    run_attempt=2,
+                )
+            ],
+            {2: run(2, "2026-09-12T00:01:00Z", run_attempt=2)},
+            documents={1: state_document(2, 1)},
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(RuntimeError, "другому запуску или попытке"):
                 restore(
                     github,
                     {"id": 3, "run_attempt": 1, "workflow_id": 10},
