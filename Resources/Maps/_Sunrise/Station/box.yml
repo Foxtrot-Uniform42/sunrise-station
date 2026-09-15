@@ -238692,7 +238692,8 @@ entities:
     - type: AccessReader
       accessListsOriginal:
       - - Bar
-      access: []
+      access:
+      - - HeadOfSecurity
   - uid: 32975
     components:
     - type: Transform
